@@ -12,3 +12,8 @@ evops:
   sensitive:
     # 测试词库落盘文件：SensitiveWordIntegrationTest 的 @BeforeAll 写入，用例内改写验证热更新
     dict-path: file:./target/test-dict/sensitive-words.txt
+
+logging:
+  file:
+    # 测试日志落盘：TraceLogIntegrationTest 据此断言 MDC 列、打码与异步传递
+    name: target/test-logs/evops.log

@@ -3,7 +3,9 @@ package com.evops.order.service;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.evops.common.BizCode;
 import com.evops.common.BizException;
+import com.evops.common.LogMasks;
 import com.evops.common.RequestContext;
+import com.evops.common.trace.TraceContext;
 import com.evops.lens.entity.Lens;
 import com.evops.lens.mapper.LensMapper;
 import com.evops.lens.service.LensService;
@@ -18,6 +20,8 @@ import com.evops.order.mapper.ProcessOrderMapper;
 import com.evops.order.mapper.ProcessOrderRxMapper;
 import com.evops.order.mapper.ProcessOrderStatusLogMapper;
 import com.evops.sensitive.SensitiveWordService;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -35,6 +39,8 @@ import java.util.Set;
  */
 @Service
 public class ProcessOrderService {
+
+    private static final Logger log = LoggerFactory.getLogger(ProcessOrderService.class);
 
     public static final String CREATED = "CREATED";
     public static final String PROCESSING = "PROCESSING";
@@ -60,6 +66,8 @@ public class ProcessOrderService {
 
     @Transactional(rollbackFor = Exception.class)
     public ProcessOrder create(OrderCreateRequest req) {
+        // 单号先入 MDC：本次请求后续所有日志（含敏感词守门、异常）都带上加工单号
+        TraceContext.putOrderNo(req.getOrderNo());
         Lens lens = requireActiveLens(req.getLensId());
 
         // 文本入口敏感词守门：BLOCK 整单拒绝；MASK 打码后落库；扫描留痕与本事务同生共死
@@ -81,6 +89,10 @@ public class ProcessOrderService {
 
         order = orderMapper.selectById(order.getId());
         writeLog(order.getId(), "CREATE", null, CREATED, "加工单建档", order.getVersionNo());
+        // 客户姓名/电话属 PII：进日志前打码，底账原文仍可在库内按权限查询
+        log.info("加工单建档 orderNo={} store={} 客户={} 电话={}", order.getOrderNo(),
+                order.getStoreCode(), LogMasks.name(order.getCustomerName()),
+                LogMasks.phone(order.getCustomerPhone()));
         return order;
     }
 
@@ -117,6 +129,7 @@ public class ProcessOrderService {
 
         order = orderMapper.selectById(order.getId());
         writeLog(order.getId(), "UPDATE", CREATED, CREATED, "修改加工单及处方", order.getVersionNo());
+        log.info("加工单修改 orderNo={} 版本={}", order.getOrderNo(), order.getVersionNo());
         return order;
     }
 
@@ -184,6 +197,7 @@ public class ProcessOrderService {
         }
         order = orderMapper.selectById(order.getId());
         writeLog(order.getId(), operType, fromStatus, toStatus, remark, order.getVersionNo());
+        log.info("加工单状态流转 orderNo={} 操作={} {}→{}", order.getOrderNo(), operType, fromStatus, toStatus);
         return order;
     }
 
@@ -195,6 +209,7 @@ public class ProcessOrderService {
 
     /** 按加工单号精确检索 */
     public ProcessOrder getByOrderNo(String orderNo) {
+        TraceContext.putOrderNo(orderNo);
         ProcessOrder order = orderMapper.selectOne(new LambdaQueryWrapper<ProcessOrder>()
                 .eq(ProcessOrder::getOrderNo, orderNo));
         if (order == null) {
@@ -305,6 +320,8 @@ public class ProcessOrderService {
         if (order == null) {
             throw new BizException(BizCode.ORDER_NOT_FOUND);
         }
+        // 加载到单据即入 MDC：后续流转/守门/异常日志都带加工单号
+        TraceContext.putOrderNo(order.getOrderNo());
         return order;
     }
 

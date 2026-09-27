@@ -7,6 +7,7 @@ import com.evops.batch.entity.BatchJobItem;
 import com.evops.batch.mapper.BatchJobItemMapper;
 import com.evops.batch.mapper.BatchJobMapper;
 import com.evops.batch.runner.BatchJobRunner;
+import com.evops.common.trace.TraceContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -75,6 +76,16 @@ public class BatchJobMaintenance implements ApplicationRunner {
 
     @Override
     public void run(ApplicationArguments args) {
+        // 启动流程无请求入口：补一个 traceId，让恢复日志与随后派发的任务日志各自成串
+        TraceContext.ensureTrace();
+        try {
+            recoverOnStartup();
+        } finally {
+            TraceContext.clear();
+        }
+    }
+
+    private void recoverOnStartup() {
         LocalDateTime now = LocalDateTime.now();
 
         // 重启时 RUNNING 任务随旧进程已死：置 FAILED，保留明细供断点重跑

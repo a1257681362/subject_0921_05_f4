@@ -7,6 +7,7 @@ import com.evops.batch.entity.BatchJobItem;
 import com.evops.batch.mapper.BatchJobItemMapper;
 import com.evops.batch.mapper.BatchJobMapper;
 import com.evops.common.RequestContext;
+import com.evops.common.trace.TraceContext;
 import com.evops.order.entity.ProcessOrder;
 import com.evops.sensitive.OrderRecheckResult;
 import com.evops.sensitive.SensitiveRecheckService;
@@ -144,6 +145,8 @@ public class BatchJobRunner {
                 .eq(BatchJob::getId, jobId)
                 .set(BatchJob::getTotalCount, total)
                 .set(BatchJob::getProgressPct, total == 0 ? 100 : 0));
+        log.info("批量任务开始 jobNo={} store={} 目标单数={}", job.getJobNo(),
+                storeCode == null ? "全部门店" : storeCode, total);
 
         // 已有明细（断点续跑依据）：SUCCESS 跳过，FAILED 重试并更新原行
         Map<Long, BatchJobItem> existing = new HashMap<>();
@@ -164,11 +167,15 @@ public class BatchJobRunner {
         for (ProcessOrder order : targets) {
             // 单据边界协作式取消：正在处理的当前单不打断
             if (isCancelRequested(jobId)) {
+                TraceContext.putOrderNo(null); // 任务级日志不带上一单号
+                log.info("批量任务取消 jobNo={} 已处理={}/{}", job.getJobNo(), success + failed, total);
                 finishTerminal(jobId, BatchJob.CANCELLED, buildReport(jobId, total),
                         "任务已取消，已处理结果保留，可重跑断点续跑");
                 return;
             }
 
+            // 逐单入 MDC：该单核对期间的日志（含敏感词扫描）都带加工单号
+            TraceContext.putOrderNo(order.getOrderNo());
             BatchJobItem item = existing.get(order.getId());
             boolean previouslyFailed = item != null && BatchJobItem.FAILED.equals(item.getItemStatus());
             if (item != null && BatchJobItem.SUCCESS.equals(item.getItemStatus())) {
@@ -188,6 +195,8 @@ public class BatchJobRunner {
                 if (previouslyFailed) {
                     failed--; // 上次失败的单这次成功
                 }
+                log.info("批量核对完成 orderNo={} 差异字段={} 一致字段={}",
+                        order.getOrderNo(), result.getDrifts().size(), result.getMatchedFields());
             } catch (Exception ex) {
                 // 单单失败独立事务已回滚该单 RECHECK 留痕：记 FAILED 明细，任务继续跑后续单
                 log.warn("批量任务单单失败 jobNo={} orderNo={}", job.getJobNo(), order.getOrderNo(), ex);
@@ -222,7 +231,9 @@ public class BatchJobRunner {
 
         boolean cancelled = isCancelRequested(jobId);
         String report = buildReport(jobId, total);
+        TraceContext.putOrderNo(null); // 回到任务级：终态汇总日志不带最后一单的单号
         if (cancelled) {
+            log.info("批量任务取消 jobNo={} 已处理={}/{}", job.getJobNo(), success + failed, total);
             finishTerminal(jobId, BatchJob.CANCELLED, report, "任务已取消，已处理结果保留，可重跑断点续跑");
         } else {
             int finalFailed = failed;
@@ -232,6 +243,7 @@ public class BatchJobRunner {
                     .set(BatchJob::getSuccessCount, success)
                     .set(BatchJob::getFailedCount, finalFailed)
                     .set(BatchJob::getProgressPct, 100));
+            log.info("批量任务结束 jobNo={} 成功={} 失败={}", job.getJobNo(), success, finalFailed);
             finishTerminal(jobId, finalFailed > 0 ? BatchJob.FAILED : BatchJob.SUCCEEDED,
                     report, finalFailed > 0 ? "部分加工单核对失败，可重跑断点续跑失败单" : null);
         }

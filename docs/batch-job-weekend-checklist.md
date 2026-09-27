@@ -72,6 +72,7 @@
 - [ ] **要中止**：`POST /api/batch/jobs/<jobNo>/cancel`——协作式取消，当前单处理完即停，已处理结果保留
 - [ ] **有失败单或被取消**：`POST /api/batch/jobs/<jobNo>/rerun`——**断点重跑**，已成功的单不重扫、不重复写留痕，只补未完成/失败的单
 - [ ] **服务重启中断**：重启时执行中的任务自动置 `FAILED`（明细保留），遗留 `PENDING` 自动继续；查 `GET /api/batch/jobs?status=FAILED` 后对相关任务 rerun
+- [ ] **要查现场日志**：每个接口的响应头都回带 `X-Trace-Id`，凭它可定位本次请求全部日志；按加工单聚合直接跑 `sh scripts/order-log.sh <加工单号>`（含批量任务后台线程的逐单日志），日志每行都带 `[traceId] [加工单号]` 两列
 - [ ] 紧急情况下同步接口 `POST /api/sensitive/recheck` 仍可用（单事务、小范围/应急）
 
 ## 六、数据安全与保留（向验光师说明）
