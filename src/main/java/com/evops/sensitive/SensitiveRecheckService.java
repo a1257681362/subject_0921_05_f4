@@ -3,11 +3,14 @@ package com.evops.sensitive;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.evops.common.BizCode;
 import com.evops.common.BizException;
+import com.evops.common.trace.TraceContext;
 import com.evops.order.entity.ProcessOrder;
 import com.evops.order.mapper.ProcessOrderMapper;
 import com.evops.sensitive.dto.RecheckReport;
 import com.evops.sensitive.entity.SensitiveScanLog;
 import com.evops.sensitive.mapper.SensitiveScanLogMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
@@ -33,6 +36,8 @@ import java.util.Map;
  */
 @Service
 public class SensitiveRecheckService {
+
+    private static final Logger log = LoggerFactory.getLogger(SensitiveRecheckService.class);
 
     private static final List<String> WRITE_OPER_TYPES = Arrays.asList("CREATE", "UPDATE");
     private static final List<String> GUARDED_FIELDS = Arrays.asList(
@@ -60,13 +65,16 @@ public class SensitiveRecheckService {
         int matchedFields = 0;
 
         for (ProcessOrder order : orders) {
-            OrderRecheckResult result = processOrder(order, latestByField);
-            if (result.isNeverScanned()) {
-                // 整单无写路径留痕（历史直插数据）：只记 neverScanned，不重复列字段差异
-                neverScanned.add(order.getOrderNo());
-            } else {
-                changed.addAll(result.getDrifts());
-                matchedFields += result.getMatchedFields();
+            // 同步路径逐单绑定单号（批量任务路径由 BatchJobRunner 绑定，这里绑了也会自动还原）
+            try (TraceContext.TraceScope ignored = TraceContext.bindOrderNo(order.getOrderNo())) {
+                OrderRecheckResult result = processOrder(order, latestByField);
+                if (result.isNeverScanned()) {
+                    // 整单无写路径留痕（历史直插数据）：只记 neverScanned，不重复列字段差异
+                    neverScanned.add(order.getOrderNo());
+                } else {
+                    changed.addAll(result.getDrifts());
+                    matchedFields += result.getMatchedFields();
+                }
             }
         }
         return new RecheckReport(wordService.dictVersion(), orders.size(),
@@ -122,6 +130,11 @@ public class SensitiveRecheckService {
             } else {
                 matchedFields++;
             }
+        }
+        if (!anyRecorded) {
+            log.info("反向核对：加工单无写路径扫描留痕（历史直插数据）");
+        } else if (!drifts.isEmpty()) {
+            log.info("反向核对：发现处置加重差异 {} 处", drifts.size());
         }
         return new OrderRecheckResult(order.getId(), order.getOrderNo(), !anyRecorded, drifts, matchedFields);
     }

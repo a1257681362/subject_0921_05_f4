@@ -1,5 +1,6 @@
 package com.evops.batch.config;
 
+import com.evops.common.trace.MdcTaskDecorator;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.scheduling.annotation.EnableAsync;
@@ -12,6 +13,8 @@ import java.util.concurrent.ThreadPoolExecutor;
  * 批量任务异步执行与定时清理开关。
  * 批量任务串行更安全（全量核对不并发打数据库/词库）：core=max=1，
  * 多出的任务在队列排队；线程满用 AbortPolicy（配合提交时的"已有活动任务"拦截，正常不会触发）。
+ * executor 挂 {@link MdcTaskDecorator}：任务在请求线程提交时快照 traceId 等 MDC 上下文，
+ * 工作线程执行前还原，后台日志与提交请求同一 traceId 串得起来。
  */
 @Configuration
 @EnableAsync
@@ -25,6 +28,7 @@ public class BatchAsyncConfig {
         executor.setMaxPoolSize(1);
         executor.setQueueCapacity(50);
         executor.setThreadNamePrefix("batch-job-");
+        executor.setTaskDecorator(new MdcTaskDecorator());
         executor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
         executor.setWaitForTasksToCompleteOnShutdown(true);
         executor.setAwaitTerminationSeconds(30);

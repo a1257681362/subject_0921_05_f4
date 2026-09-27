@@ -19,6 +19,21 @@ Spring Boot 骨架项目。技术栈：Java 8、Spring Boot 2.7、MyBatis-Plus�
 - 重复提交由库层唯一约束兜底：`t_process_order.uk_order_request(request_no)` → `REQUEST_DUPLICATED`；单号/编码各有唯一约束。
 - 关联表（加工单主表 + 左右眼处方）同一事务，要么全部生效，要么全部不见。
 
+## 链路日志（总部质控要求）
+
+每张加工单从建档到后台核对的全部日志可按单号一键聚合，不再靠人工翻日志拼报表：
+
+- **TraceId 贯穿全链路**：HTTP 入口 `TraceIdFilter` 生成 `trace-yyyyMMddHHmmss-<16位hex>`（上游传 `X-Trace-Id` 则沿用，网关联调可透传）；**响应头 `X-Trace-Id` 原样回带**，报障凭此号直接捞日志。异步线程池（`MdcTaskDecorator` 快照传递）与定时任务/启动恢复（自生成 `sched-`/`boot-`/`job-` 前缀号）同样携带，后台日志与提交请求同一 traceId 串得起来。
+- **日志格式统一带加工单号**：每行固定 `[traceId] [orderNo] [jobNo]` 三段（无值显示 `-`），见 `logback-spring.xml`；控制台与 `logs/evops.log`（按天+50MB 滚动，留 30 天）同格式。业务处理一张单前把单号绑进 MDC（`TraceContext.bindOrderNo`），批量任务再叠加 `jobNo`。
+- **按单号一键聚合检索**：
+  ```bash
+  grep '\[O-20260927-0001\]' logs/evops.log          # 该单全部日志（含后台线程）
+  grep 'trace-20260927094531-ab12cd34ef567890' logs/evops.log   # 该次请求全链路
+  grep '\[RECHECK-20260927031700-AB12CD\]' logs/evops.log       # 该批量任务
+  ```
+- **敏感字段入日志前打码**：手机号 `138****5678`、姓名 `张*丰`（`LogMasker`），原文不出现在日志；命中词本身也不进日志（只记命中数），防止敏感词扩散。MDC 值统一清洗换行/控制字符，防日志注入。
+- 验收样例（最绕路径：拦截→打码→改单→全状态流转→冲销恢复→异步核对→定时清理）见 `TraceLogIntegrationTest`。
+
 ## 业务表
 
 | 表 | 说明 |

@@ -3,7 +3,9 @@ package com.evops.order.service;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.evops.common.BizCode;
 import com.evops.common.BizException;
+import com.evops.common.LogMasker;
 import com.evops.common.RequestContext;
+import com.evops.common.trace.TraceContext;
 import com.evops.lens.entity.Lens;
 import com.evops.lens.mapper.LensMapper;
 import com.evops.lens.service.LensService;
@@ -18,6 +20,8 @@ import com.evops.order.mapper.ProcessOrderMapper;
 import com.evops.order.mapper.ProcessOrderRxMapper;
 import com.evops.order.mapper.ProcessOrderStatusLogMapper;
 import com.evops.sensitive.SensitiveWordService;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -35,6 +39,8 @@ import java.util.Set;
  */
 @Service
 public class ProcessOrderService {
+
+    private static final Logger log = LoggerFactory.getLogger(ProcessOrderService.class);
 
     public static final String CREATED = "CREATED";
     public static final String PROCESSING = "PROCESSING";
@@ -60,64 +66,77 @@ public class ProcessOrderService {
 
     @Transactional(rollbackFor = Exception.class)
     public ProcessOrder create(OrderCreateRequest req) {
-        Lens lens = requireActiveLens(req.getLensId());
+        // 建档起整链路的日志都带加工单号（MDC），后续异步核对/定时任务同号可聚合
+        try (TraceContext.TraceScope ignored = TraceContext.bindOrderNo(req.getOrderNo())) {
+            Lens lens = requireActiveLens(req.getLensId());
 
-        // 文本入口敏感词守门：BLOCK 整单拒绝；MASK 打码后落库；扫描留痕与本事务同生共死
-        SensitiveWordService.MaskedOrderText guarded = sensitiveWordService.guardOrderText(
-                null, req.getOrderNo(), req.getCustomerName(), req.getRemark(), "CREATE");
+            // 文本入口敏感词守门：BLOCK 整单拒绝；MASK 打码后落库；扫描留痕与本事务同生共死
+            SensitiveWordService.MaskedOrderText guarded = sensitiveWordService.guardOrderText(
+                    null, req.getOrderNo(), req.getCustomerName(), req.getRemark(), "CREATE");
 
-        ProcessOrder order = new ProcessOrder();
-        order.setOrderNo(req.getOrderNo());
-        order.setCustomerName(guarded.getCustomerName());
-        order.setCustomerPhone(req.getCustomerPhone());
-        order.setStoreCode(req.getStoreCode());
-        order.setLensId(lens.getId());
-        order.setRemark(guarded.getRemark());
-        order.setOrderStatus(CREATED);
-        // uk_order_no 兜底单号重复，uk_order_request 兜底请求号重复提交
-        orderMapper.insert(order);
+            ProcessOrder order = new ProcessOrder();
+            order.setOrderNo(req.getOrderNo());
+            order.setCustomerName(guarded.getCustomerName());
+            order.setCustomerPhone(req.getCustomerPhone());
+            order.setStoreCode(req.getStoreCode());
+            order.setLensId(lens.getId());
+            order.setRemark(guarded.getRemark());
+            order.setOrderStatus(CREATED);
+            // uk_order_no 兜底单号重复，uk_order_request 兜底请求号重复提交
+            orderMapper.insert(order);
 
-        insertPrescriptions(order.getId(), req.getPrescriptions());
+            insertPrescriptions(order.getId(), req.getPrescriptions());
 
-        order = orderMapper.selectById(order.getId());
-        writeLog(order.getId(), "CREATE", null, CREATED, "加工单建档", order.getVersionNo());
-        return order;
+            order = orderMapper.selectById(order.getId());
+            writeLog(order.getId(), "CREATE", null, CREATED, "加工单建档", order.getVersionNo());
+            // 敏感字段打码后再入日志：手机号/姓名不原文输出
+            log.info("加工单建档成功 storeCode={} lensId={} customer={} phone={}",
+                    order.getStoreCode(), lens.getId(),
+                    LogMasker.maskName(guarded.getCustomerName()),
+                    LogMasker.maskPhone(req.getCustomerPhone()));
+            return order;
+        }
     }
 
     @Transactional(rollbackFor = Exception.class)
     public ProcessOrder update(OrderUpdateRequest req) {
         ProcessOrder order = requireOrder(req.getId());
-        if (!CREATED.equals(order.getOrderStatus())) {
-            throw new BizException(BizCode.ORDER_STATUS_ILLEGAL, "仅已建档状态可修改");
+        try (TraceContext.TraceScope ignored = TraceContext.bindOrderNo(order.getOrderNo())) {
+            if (!CREATED.equals(order.getOrderStatus())) {
+                throw new BizException(BizCode.ORDER_STATUS_ILLEGAL, "仅已建档状态可修改");
+            }
+            if (req.getVersionNo() != null && !req.getVersionNo().equals(order.getVersionNo())) {
+                throw new BizException(BizCode.VERSION_CONFLICT);
+            }
+            Long lensId = req.getLensId() == null ? order.getLensId() : requireActiveLens(req.getLensId()).getId();
+
+            order.setLensId(lensId);
+            if (req.getCustomerName() != null) order.setCustomerName(req.getCustomerName());
+            if (req.getCustomerPhone() != null) order.setCustomerPhone(req.getCustomerPhone());
+            if (req.getStoreCode() != null) order.setStoreCode(req.getStoreCode());
+            if (req.getRemark() != null) order.setRemark(req.getRemark());
+
+            // 守门扫描合并后的最终落库值：BLOCK 拒绝本次修改；MASK 打码后落库
+            SensitiveWordService.MaskedOrderText guarded = sensitiveWordService.guardOrderText(
+                    order.getId(), order.getOrderNo(), order.getCustomerName(), order.getRemark(), "UPDATE");
+            order.setCustomerName(guarded.getCustomerName());
+            order.setRemark(guarded.getRemark());
+
+            if (orderMapper.updateById(order) == 0) {
+                throw new BizException(BizCode.VERSION_CONFLICT);
+            }
+
+            // 处方整组原子替换：旧 ACTIVE 行置 VOID（保留痕迹，不物理删除），再插入新行
+            voidActivePrescriptions(order.getId());
+            insertPrescriptions(order.getId(), req.getPrescriptions());
+
+            order = orderMapper.selectById(order.getId());
+            writeLog(order.getId(), "UPDATE", CREATED, CREATED, "修改加工单及处方", order.getVersionNo());
+            log.info("加工单修改成功 lensId={} customer={} phone={}",
+                    lensId, LogMasker.maskName(order.getCustomerName()),
+                    LogMasker.maskPhone(order.getCustomerPhone()));
+            return order;
         }
-        if (req.getVersionNo() != null && !req.getVersionNo().equals(order.getVersionNo())) {
-            throw new BizException(BizCode.VERSION_CONFLICT);
-        }
-        Long lensId = req.getLensId() == null ? order.getLensId() : requireActiveLens(req.getLensId()).getId();
-
-        order.setLensId(lensId);
-        if (req.getCustomerName() != null) order.setCustomerName(req.getCustomerName());
-        if (req.getCustomerPhone() != null) order.setCustomerPhone(req.getCustomerPhone());
-        if (req.getStoreCode() != null) order.setStoreCode(req.getStoreCode());
-        if (req.getRemark() != null) order.setRemark(req.getRemark());
-
-        // 守门扫描合并后的最终落库值：BLOCK 拒绝本次修改；MASK 打码后落库
-        SensitiveWordService.MaskedOrderText guarded = sensitiveWordService.guardOrderText(
-                order.getId(), order.getOrderNo(), order.getCustomerName(), order.getRemark(), "UPDATE");
-        order.setCustomerName(guarded.getCustomerName());
-        order.setRemark(guarded.getRemark());
-
-        if (orderMapper.updateById(order) == 0) {
-            throw new BizException(BizCode.VERSION_CONFLICT);
-        }
-
-        // 处方整组原子替换：旧 ACTIVE 行置 VOID（保留痕迹，不物理删除），再插入新行
-        voidActivePrescriptions(order.getId());
-        insertPrescriptions(order.getId(), req.getPrescriptions());
-
-        order = orderMapper.selectById(order.getId());
-        writeLog(order.getId(), "UPDATE", CREATED, CREATED, "修改加工单及处方", order.getVersionNo());
-        return order;
     }
 
     // ---------------- 取镜状态流转 ----------------
@@ -177,14 +196,17 @@ public class ProcessOrderService {
     }
 
     private ProcessOrder applyTransit(ProcessOrder order, String operType, String toStatus, String remark) {
-        String fromStatus = order.getOrderStatus();
-        order.setOrderStatus(toStatus);
-        if (orderMapper.updateById(order) == 0) {
-            throw new BizException(BizCode.VERSION_CONFLICT);
+        try (TraceContext.TraceScope ignored = TraceContext.bindOrderNo(order.getOrderNo())) {
+            String fromStatus = order.getOrderStatus();
+            order.setOrderStatus(toStatus);
+            if (orderMapper.updateById(order) == 0) {
+                throw new BizException(BizCode.VERSION_CONFLICT);
+            }
+            order = orderMapper.selectById(order.getId());
+            writeLog(order.getId(), operType, fromStatus, toStatus, remark, order.getVersionNo());
+            log.info("加工单状态流转 operType={} {} -> {}", operType, fromStatus, toStatus);
+            return order;
         }
-        order = orderMapper.selectById(order.getId());
-        writeLog(order.getId(), operType, fromStatus, toStatus, remark, order.getVersionNo());
-        return order;
     }
 
     // ---------------- 查询 ----------------

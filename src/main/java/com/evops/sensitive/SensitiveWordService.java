@@ -2,6 +2,8 @@ package com.evops.sensitive;
 
 import com.evops.common.BizCode;
 import com.evops.common.BizException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import javax.annotation.Resource;
@@ -14,6 +16,8 @@ import java.util.List;
  */
 @Service
 public class SensitiveWordService {
+
+    private static final Logger log = LoggerFactory.getLogger(SensitiveWordService.class);
 
     /** 加工单纳入管控的文本入口 */
     public static final String FIELD_CUSTOMER_NAME = "customerName";
@@ -56,6 +60,9 @@ public class SensitiveWordService {
             if (remarkOutcome.isBlocked()) {
                 scanLogService.logBlockedNewTx(orderId, orderNo, FIELD_REMARK, remarkOutcome, operType);
             }
+            // 拦截事件进日志（orderNo 由调用方绑定到 MDC）；命中词本身不输出，避免敏感词扩散到日志
+            log.warn("加工单文本命中拦截级敏感词，整单拒绝 operType={} nameHits={} remarkHits={}",
+                    operType, nameOutcome.getHits().size(), remarkOutcome.getHits().size());
             throw new BizException(BizCode.SENSITIVE_WORD_BLOCKED, blockDetail(nameOutcome, remarkOutcome));
         }
 

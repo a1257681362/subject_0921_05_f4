@@ -7,6 +7,7 @@ import com.evops.batch.entity.BatchJobItem;
 import com.evops.batch.mapper.BatchJobItemMapper;
 import com.evops.batch.mapper.BatchJobMapper;
 import com.evops.common.RequestContext;
+import com.evops.common.trace.TraceContext;
 import com.evops.order.entity.ProcessOrder;
 import com.evops.sensitive.OrderRecheckResult;
 import com.evops.sensitive.SensitiveRecheckService;
@@ -123,12 +124,19 @@ public class BatchJobRunner {
         job = jobMapper.selectById(jobId);
         // 后台写出的 RECHECK 留痕等审计字段挂到提交人与任务号上，可追溯
         RequestContext.set(job.getCreatedBy(), "JOB:" + job.getJobNo(), null);
-        try {
-            execute(jobId, job);
-        } catch (Exception ex) {
-            log.error("批量任务整体异常 jobNo={}", job.getJobNo(), ex);
-            finishTerminal(jobId, BatchJob.FAILED, null,
-                    "任务执行异常：" + truncate(ex.getMessage(), ERROR_MESSAGE_MAX));
+        // 请求线程提交时 traceId 经 MdcTaskDecorator 带入；启动恢复等无上游场景补 job- 前缀新号。
+        // 整个任务执行期绑定 jobNo，逐单再叠加 orderNo：按任务号/加工单号都能把后台日志一把捞齐。
+        String traceId = TraceContext.ensureTraceId("job-");
+        try (TraceContext.TraceScope ignoredTrace = TraceContext.bindTraceId(traceId);
+             TraceContext.TraceScope ignoredJob = TraceContext.bindJobNo(job.getJobNo())) {
+            log.info("批量任务开始执行 jobNo={} jobType={}", job.getJobNo(), job.getJobType());
+            try {
+                execute(jobId, job);
+            } catch (Exception ex) {
+                log.error("批量任务整体异常 jobNo={}", job.getJobNo(), ex);
+                finishTerminal(jobId, BatchJob.FAILED, null,
+                        "任务执行异常：" + truncate(ex.getMessage(), ERROR_MESSAGE_MAX));
+            }
         } finally {
             RequestContext.clear();
         }
@@ -169,61 +177,67 @@ public class BatchJobRunner {
                 return;
             }
 
-            BatchJobItem item = existing.get(order.getId());
-            boolean previouslyFailed = item != null && BatchJobItem.FAILED.equals(item.getItemStatus());
-            if (item != null && BatchJobItem.SUCCESS.equals(item.getItemStatus())) {
-                continue; // 断点：上次已成功，不重复扫、不重复写 RECHECK 留痕
-            }
+            // 单单绑定加工单号：本单核对/留痕/失败日志均带 orderNo，与建档时的请求日志按单号可聚合
+            try (TraceContext.TraceScope ignoredOrder = TraceContext.bindOrderNo(order.getOrderNo())) {
+                BatchJobItem item = existing.get(order.getId());
+                boolean previouslyFailed = item != null && BatchJobItem.FAILED.equals(item.getItemStatus());
+                if (item != null && BatchJobItem.SUCCESS.equals(item.getItemStatus())) {
+                    continue; // 断点：上次已成功，不重复扫、不重复写 RECHECK 留痕
+                }
 
-            try {
-                OrderRecheckResult result = recheckService.recheckOneInNewTx(order.getId());
-                if (item == null) {
-                    item = newItem(jobId, order);
+                try {
+                    OrderRecheckResult result = recheckService.recheckOneInNewTx(order.getId());
+                    if (item == null) {
+                        item = newItem(jobId, order);
+                    }
+                    item.setItemStatus(BatchJobItem.SUCCESS);
+                    item.setFailReason(null);
+                    item.setResultJson(writeResultJson(result));
+                    saveItem(item);
+                    success++;
+                    if (previouslyFailed) {
+                        failed--; // 上次失败的单这次成功
+                    }
+                } catch (Exception ex) {
+                    // 单单失败独立事务已回滚该单 RECHECK 留痕：记 FAILED 明细，任务继续跑后续单
+                    log.warn("批量任务单单失败 jobNo={} orderNo={}", job.getJobNo(), order.getOrderNo(), ex);
+                    if (item == null) {
+                        item = newItem(jobId, order);
+                    }
+                    item.setItemStatus(BatchJobItem.FAILED);
+                    item.setFailReason(truncate(ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage(),
+                            FAIL_REASON_MAX));
+                    saveItem(item);
+                    if (!previouslyFailed) {
+                        failed++; // 新失败的单；上次就失败的单计数不变
+                    }
                 }
-                item.setItemStatus(BatchJobItem.SUCCESS);
-                item.setFailReason(null);
-                item.setResultJson(writeResultJson(result));
-                saveItem(item);
-                success++;
-                if (previouslyFailed) {
-                    failed--; // 上次失败的单这次成功
-                }
-            } catch (Exception ex) {
-                // 单单失败独立事务已回滚该单 RECHECK 留痕：记 FAILED 明细，任务继续跑后续单
-                log.warn("批量任务单单失败 jobNo={} orderNo={}", job.getJobNo(), order.getOrderNo(), ex);
-                if (item == null) {
-                    item = newItem(jobId, order);
-                }
-                item.setItemStatus(BatchJobItem.FAILED);
-                item.setFailReason(truncate(ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage(),
-                        FAIL_REASON_MAX));
-                saveItem(item);
-                if (!previouslyFailed) {
-                    failed++; // 新失败的单；上次就失败的单计数不变
-                }
-            }
-            existing.put(order.getId(), item);
+                existing.put(order.getId(), item);
+                // 每单一行（orderNo 由 MDC 携带）：按单号可把该单在后台线程的处理日志一并捞出
+                log.info("批量任务单单处理完毕 itemStatus={}", item.getItemStatus());
 
-            // 计数每单精确落库；progress_pct 只在跨 5% 档位时变化
-            int processed = success + failed;
-            int bucket = total == 0 ? 100 : Math.min(100, (processed * 100 / total) / 5 * 5);
-            LambdaUpdateWrapper<BatchJob> uw = new LambdaUpdateWrapper<BatchJob>()
-                    .eq(BatchJob::getId, jobId)
-                    .set(BatchJob::getProcessedCount, processed)
-                    .set(BatchJob::getSuccessCount, success)
-                    .set(BatchJob::getFailedCount, failed);
-            if (bucket != lastBucket) {
-                uw.set(BatchJob::getProgressPct, bucket);
-                lastBucket = bucket;
+                // 计数每单精确落库；progress_pct 只在跨 5% 档位时变化
+                int processed = success + failed;
+                int bucket = total == 0 ? 100 : Math.min(100, (processed * 100 / total) / 5 * 5);
+                LambdaUpdateWrapper<BatchJob> uw = new LambdaUpdateWrapper<BatchJob>()
+                        .eq(BatchJob::getId, jobId)
+                        .set(BatchJob::getProcessedCount, processed)
+                        .set(BatchJob::getSuccessCount, success)
+                        .set(BatchJob::getFailedCount, failed);
+                if (bucket != lastBucket) {
+                    uw.set(BatchJob::getProgressPct, bucket);
+                    lastBucket = bucket;
+                }
+                jobMapper.update(null, uw);
+                throttle();
             }
-            jobMapper.update(null, uw);
-            throttle();
         }
 
         boolean cancelled = isCancelRequested(jobId);
         String report = buildReport(jobId, total);
         if (cancelled) {
             finishTerminal(jobId, BatchJob.CANCELLED, report, "任务已取消，已处理结果保留，可重跑断点续跑");
+            log.info("批量任务已取消 jobNo={} 成功={} 失败={}", job.getJobNo(), success, failed);
         } else {
             int finalFailed = failed;
             jobMapper.update(null, new LambdaUpdateWrapper<BatchJob>()
@@ -232,8 +246,11 @@ public class BatchJobRunner {
                     .set(BatchJob::getSuccessCount, success)
                     .set(BatchJob::getFailedCount, finalFailed)
                     .set(BatchJob::getProgressPct, 100));
-            finishTerminal(jobId, finalFailed > 0 ? BatchJob.FAILED : BatchJob.SUCCEEDED,
+            String terminal = finalFailed > 0 ? BatchJob.FAILED : BatchJob.SUCCEEDED;
+            finishTerminal(jobId, terminal,
                     report, finalFailed > 0 ? "部分加工单核对失败，可重跑断点续跑失败单" : null);
+            log.info("批量任务执行完毕 jobNo={} 状态={} 总数={} 成功={} 失败={}",
+                    job.getJobNo(), terminal, total, success, finalFailed);
         }
     }
 

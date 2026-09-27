@@ -7,6 +7,7 @@ import com.evops.batch.entity.BatchJobItem;
 import com.evops.batch.mapper.BatchJobItemMapper;
 import com.evops.batch.mapper.BatchJobMapper;
 import com.evops.batch.runner.BatchJobRunner;
+import com.evops.common.trace.TraceContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -44,12 +45,14 @@ public class BatchJobMaintenance implements ApplicationRunner {
     @Value("${evops.batch.retain-days:21}")
     private int retainDays;
 
-    /** 每日 03:17 清理到期任务记录（避开整点） */
+    /** 每日 03:17 清理到期任务记录（避开整点）；定时触发无请求上下文，自生成 sched- 前缀 traceId */
     @Scheduled(cron = "${evops.batch.cleanup-cron:0 17 3 * * ?}")
     public void scheduledPurge() {
-        int removed = purgeExpired();
-        if (removed > 0) {
-            log.info("批量任务记录清理：物理删除到期任务 {} 个", removed);
+        try (TraceContext.TraceScope ignored = TraceContext.bindTraceId(TraceContext.newTraceId("sched-"))) {
+            int removed = purgeExpired();
+            if (removed > 0) {
+                log.info("批量任务记录清理：物理删除到期任务 {} 个", removed);
+            }
         }
     }
 
@@ -75,6 +78,13 @@ public class BatchJobMaintenance implements ApplicationRunner {
 
     @Override
     public void run(ApplicationArguments args) {
+        // 启动恢复脱离请求线程：整个恢复过程挂 boot- 前缀 traceId，重派发的任务经装饰器继承
+        try (TraceContext.TraceScope ignored = TraceContext.bindTraceId(TraceContext.newTraceId("boot-"))) {
+            recoverOnStartup();
+        }
+    }
+
+    private void recoverOnStartup() {
         LocalDateTime now = LocalDateTime.now();
 
         // 重启时 RUNNING 任务随旧进程已死：置 FAILED，保留明细供断点重跑

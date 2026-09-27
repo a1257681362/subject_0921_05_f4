@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  统一日志格式（总部质控要求）：
+  每行固定携带 traceId / orderNo / jobNo 三个 MDC 字段，无值显示 "-"：
+    2026-09-27 03:17:00.123 INFO  [trace-20260927031700-a1b2c3d4e5f60708] [O-20260927-0001] [-] [batch-job-1] c.e.b.r.BatchJobRunner : 批量任务开始执行 ...
+  聚合检索：
+    按加工单号  grep '\[O-20260927-0001\]' logs/evops.log
+    按链路号    grep 'trace-20260927031700-a1b2c3d4e5f60708' logs/evops.log（响应头 X-Trace-Id 同值）
+    按任务号    grep '\[RECHECK-20260927031700-AB12CD\]' logs/evops.log
+  异步线程（MdcTaskDecorator）与定时任务（sched- 前缀 traceId）同样输出这三个字段。
+-->
+<configuration>
+    <property name="LOG_PATTERN"
+              value="%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%X{traceId:--}] [%X{orderNo:--}] [%X{jobNo:--}] [%thread] %logger{36} : %msg%n"/>
+    <property name="LOG_FILE" value="${LOG_FILE:-logs/evops.log}"/>
+
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>${LOG_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_FILE}</file>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>logs/evops.%d{yyyy-MM-dd}.%i.log.gz</fileNamePattern>
+            <maxFileSize>50MB</maxFileSize>
+            <maxHistory>30</maxHistory>
+            <totalSizeCap>2GB</totalSizeCap>
+        </rollingPolicy>
+        <encoder>
+            <pattern>${LOG_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <root level="INFO">
+        <appender-ref ref="CONSOLE"/>
+        <appender-ref ref="FILE"/>
+    </root>
+</configuration>
